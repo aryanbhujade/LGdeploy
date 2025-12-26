@@ -1,0 +1,38 @@
+# ======================================================
+# PyTorch CUDA (NVIDIA T1000, Driver 573.xx, Python 3.12)
+# ======================================================
+# This URL forces pip to grab the GPU-accelerated versions
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+
+# ======================================================
+# YOLO / Computer Vision
+# ======================================================
+ultralytics==8.3.240
+opencv-python==4.12.0.88
+
+# ======================================================
+# Scientific / Numeric (Python 3.12 SAFE)
+# ======================================================
+# Pinned to ensure compatibility with filterpy & new Python 3.12
+numpy>=1.26.4,<2.0.0
+pandas>=2.2.0
+scipy>=1.11.4,<1.13
+
+# ======================================================
+# Utilities
+# ======================================================
+tqdm==4.67.1
+PyYAML==6.0.1
+requests==2.32.3
+psutil==5.9.8
+pillow>=10.3.0
+
+# ======================================================
+# Tracking
+# ======================================================
+filterpy==1.4.5
+# We removed 'lap'/'lapx' because run_counter.py now uses scipy internally
