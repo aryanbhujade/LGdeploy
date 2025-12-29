@@ -191,8 +191,23 @@ input_folder = "LG_videos"
 output_folder = "results"
 os.makedirs(output_folder, exist_ok=True)
 
+
 # Only process DOCK19 videos (including Decount variants)
 VIDEO_GLOB = "DOCK19*.mp4"
+
+# RTSP quick-test (LG server)
+# Set ENABLE_RTSP_TEST = True to sanity-check streams before running full video processing.
+ENABLE_RTSP_TEST = False
+RTSP_TEST_SECONDS = 20
+RTSP_TEST_MAX_FRAMES = None  # set an int to cap frames instead of time
+RTSP_SAMPLE_EVERY_N_FRAMES = 3  # run model on every Nth frame to reduce load
+RTSP_URLS = [
+    "rtsp://admin:Camera%40123@10.101.74.52:554/Streaming/channels/101",
+    "rtsp://admin:Camera%40123@10.101.74.53:554/Streaming/channels/101",
+    "rtsp://admin:Camera%40123@10.101.74.54:554/Streaming/channels/101",
+    "rtsp://admin:Camera%40123@10.101.74.56:554/Streaming/channels/101",
+    "rtsp://admin:Camera%40123@10.101.74.57:554/Streaming/channels/101",
+]
 
 # Robustness Knobs
 MIN_TRACK_FRAMES_BEFORE_COUNT = 4
@@ -250,6 +265,73 @@ def scale_line(pt1, pt2, curr_w, curr_h):
     scale_y = curr_h / BASE_RES_H
     return (int(pt1[0] * scale_x), int(pt1[1] * scale_y)), (int(pt2[0] * scale_x), int(pt2[1] * scale_y))
 
+# --- RTSP Quick Test Helper ---
+def rtsp_quick_test(model, device, urls, seconds=20, max_frames=None, sample_every_n=3):
+    """Open each RTSP stream and run lightweight inference for a short window.
+
+    This is meant as a connectivity + compatibility smoke-test on the LG admin machine.
+    """
+    for url in urls:
+        print(f"\nRTSP test: {url}")
+        cap = cv2.VideoCapture(url)
+        if not cap.isOpened():
+            print("RTSP failed: could not open")
+            continue
+
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        print(f"Opened: {w}x{h} reported_fps={fps:.2f}")
+
+        t_start = time.perf_counter()
+        frames = 0
+        infer_frames = 0
+        total_dets = 0
+
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                if (time.perf_counter() - t_start) < 5.0:
+                    continue
+                print("RTSP failed: no frames")
+                break
+
+            frames += 1
+
+            do_infer = (frames % max(1, int(sample_every_n)) == 0)
+            if do_infer:
+                infer_frames += 1
+                results = model.predict(
+                    source=frame,
+                    imgsz=640,
+                    conf=CONFIDENCE_THRESHOLD,
+                    iou=0.70,
+                    max_det=300,
+                    device=device,
+                    verbose=False,
+                )
+                r = results[0]
+                det_count = int(len(r.boxes)) if (r.boxes is not None) else 0
+                total_dets += det_count
+
+            elapsed = time.perf_counter() - t_start
+            if max_frames is not None and frames >= int(max_frames):
+                break
+            if max_frames is None and elapsed >= float(seconds):
+                break
+
+        cap.release()
+
+        elapsed = max(1e-6, time.perf_counter() - t_start)
+        fps_measured = frames / elapsed
+        infer_fps = infer_frames / elapsed
+        avg_dets = (total_dets / max(1, infer_frames))
+
+        print(
+            f"RTSP ok: frames={frames} elapsed={elapsed:.2f}s fps={fps_measured:.2f} "
+            f"infer_frames={infer_frames} infer_fps={infer_fps:.2f} avg_dets={avg_dets:.2f}"
+        )
+
 # --- Main Execution ---
 if __name__ == "__main__":
     print("LG Box Counter Starting...")
@@ -281,6 +363,17 @@ if __name__ == "__main__":
             print(f"GPU: {torch.cuda.get_device_name(0)}")
         except Exception:
             pass
+
+    if ENABLE_RTSP_TEST:
+        rtsp_quick_test(
+            model=model,
+            device=DEVICE,
+            urls=RTSP_URLS,
+            seconds=RTSP_TEST_SECONDS,
+            max_frames=RTSP_TEST_MAX_FRAMES,
+            sample_every_n=RTSP_SAMPLE_EVERY_N_FRAMES,
+        )
+        raise SystemExit(0)
 
     # Process Videos
     video_files = sorted(glob.glob(os.path.join(input_folder, VIDEO_GLOB)))
