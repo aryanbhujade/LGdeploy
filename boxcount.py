@@ -11,6 +11,10 @@ from ultralytics import YOLO
 from filterpy.kalman import KalmanFilter
 from scipy.optimize import linear_sum_assignment
 import sqlite3
+import argparse
+
+# For Python 3.8 compatibility with type hints
+from typing import Tuple, Optional
 
 # Suppress annoying pytorch warnings
 warnings.filterwarnings("ignore", message=".*autocast.*", category=FutureWarning)
@@ -183,163 +187,300 @@ def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
 # PART 2: THE INFERENCE & COUNTING LOGIC
 # ===========================================================================
 
-# --- Configuration (DOCK19 ONLY) ---
+#
+# --- Configuration (camera-agnostic) ---
+#
 MODEL_VERSION = "4"
-DOCK_NAME = "DOCK19"
+
+# Human-readable identifier for the stream/camera/area.
+# Change per deployment (e.g., "DOCK19", "DOCK22", "CAMERA_53", etc.)
+CAMERA_AREA = "CAMERA"
 
 input_folder = "LG_videos"
 output_folder = "results"
 os.makedirs(output_folder, exist_ok=True)
 
+# Process any mp4 in the input folder by default
+VIDEO_GLOB = "newangle.mp4"
 
-# Only process DOCK19 videos (including Decount variants)
-VIDEO_GLOB = "DOCK19*.mp4"
-
-# RTSP quick-test (LG server)
-# Set ENABLE_RTSP_TEST = True to sanity-check streams before running full video processing.
-ENABLE_RTSP_TEST = False
-RTSP_TEST_SECONDS = 20
-RTSP_TEST_MAX_FRAMES = None  # set an int to cap frames instead of time
-RTSP_SAMPLE_EVERY_N_FRAMES = 3  # run model on every Nth frame to reduce load
-RTSP_URLS = [
-    "rtsp://admin:Camera%40123@10.101.74.52:554/Streaming/channels/101",
-    "rtsp://admin:Camera%40123@10.101.74.53:554/Streaming/channels/101",
-    "rtsp://admin:Camera%40123@10.101.74.54:554/Streaming/channels/101",
-    "rtsp://admin:Camera%40123@10.101.74.56:554/Streaming/channels/101",
-    "rtsp://admin:Camera%40123@10.101.74.57:554/Streaming/channels/101",
-]
+# RTSP/video source can be provided via CLI args (see usage below).
 
 # Robustness Knobs
 MIN_TRACK_FRAMES_BEFORE_COUNT = 4
 LINE_CROSS_EPS = 15.0  # Deadzone around the line
-EVENT_COOLDOWN_SECONDS = 1.5
+EVENT_COOLDOWN_SECONDS = 0.0  # legacy; kept for backward-compat but not used by the new logic
+# Separate cooldowns per direction so a fast "tip over then pull back" reliably triggers -1.
+IN_EVENT_COOLDOWN_SECONDS = 0.25
+OUT_EVENT_COOLDOWN_SECONDS = 0.0
 MIN_BOX_AREA = 800
 ID_PURGE_FRAMES = 50
 CONFIDENCE_THRESHOLD = 0.30
 
-# Base Resolution (the coordinates below were calibrated on this resolution)
-BASE_RES_W = 2592.0
-BASE_RES_H = 1944.0
+# Counting line definition (camera-agnostic)
+# Horizontal line spanning the frame width, placed near the bottom.
+LINE_OFFSET_FROM_BOTTOM_PX = 160
 
-# DOCK19 line coordinates (defined at BASE_RES)
-DOCK19_LINE_BASE = ((1523, 718), (2202, 874))
+# --- Stats printing interval ---
+STATS_PRINT_EVERY_S = 20
 
 # --- Database (SQLite) ---
 DB_PATH = "lg_counts.db"
 
+# We now log ONE row per saved output file (mp4 or RTSP clip), not per event.
+# This keeps the DB compact and aligned with video artifacts.
+
 def init_db():
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS box_counts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          camera_area TEXT NOT NULL,
-          datetime_utc TEXT NOT NULL,
-          box_count INTEGER NOT NULL,
-          delta INTEGER NOT NULL,
-          source TEXT NOT NULL,
-          model_path TEXT,
-          model_version TEXT
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS box_count_clips (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              camera_area TEXT NOT NULL,
+              clip_start_utc TEXT NOT NULL,
+              clip_end_utc TEXT NOT NULL,
+              source TEXT NOT NULL,
+              output_path TEXT NOT NULL,
+              final_box_count INTEGER NOT NULL,
+              model_path TEXT,
+              model_version TEXT
+            )
+            """
         )
-        """)
-        con.execute("""
-        CREATE INDEX IF NOT EXISTS idx_box_counts_area_time
-        ON box_counts(camera_area, datetime_utc)
-        """)
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_box_count_clips_area_time
+            ON box_count_clips(camera_area, clip_start_utc)
+            """
+        )
 
-def log_count(camera_area, box_count, delta, source, model_path, model_version):
-    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def log_clip_summary(
+    camera_area: str,
+    clip_start_utc: str,
+    clip_end_utc: str,
+    source: str,
+    output_path: str,
+    final_box_count: int,
+    model_path: str,
+    model_version: str,
+) -> None:
+    """Log one record per saved clip/video."""
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO box_counts(camera_area, datetime_utc, box_count, delta, source, model_path, model_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (camera_area, ts, box_count, delta, source, model_path, model_version))
+        con.execute(
+            """
+            INSERT INTO box_count_clips(
+              camera_area, clip_start_utc, clip_end_utc,
+              source, output_path, final_box_count,
+              model_path, model_version
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(camera_area),
+                str(clip_start_utc),
+                str(clip_end_utc),
+                str(source),
+                str(output_path),
+                int(final_box_count),
+                str(model_path) if model_path is not None else None,
+                str(model_version) if model_version is not None else None,
+            ),
+        )
 
 # --- Helper Functions ---
 
 def point_side(px: float, py: float, p1, p2) -> float:
+    """Signed value for which side of the oriented line a point lies on."""
     (lx1, ly1), (lx2, ly2) = p1, p2
     return (lx2 - lx1) * (py - ly1) - (ly2 - ly1) * (px - lx1)
 
-def scale_line(pt1, pt2, curr_w, curr_h):
-    scale_x = curr_w / BASE_RES_W
-    scale_y = curr_h / BASE_RES_H
-    return (int(pt1[0] * scale_x), int(pt1[1] * scale_y)), (int(pt2[0] * scale_x), int(pt2[1] * scale_y))
+
+def bbox_rel_to_horizontal_line(x1: int, y1: int, x2: int, y2: int, line_y: int) -> Tuple[float, float, float]:
+    """Return (top_rel, bottom_rel, bottom_center_y_rel) relative to a horizontal line at y=line_y.
+
+    Negative means above the line, positive means below the line.
+    We use bbox edges (top/bottom) instead of centroid because near the frame boundary
+    the bbox can be clipped and centroid becomes unstable.
+    """
+    top_rel = float(y1 - line_y)
+    bottom_rel = float(y2 - line_y)
+    bc_rel = float(((y1 + y2) * 0.5) - line_y)
+    return top_rel, bottom_rel, bc_rel
+
+
+def classify_bbox_side(bottom_rel: float, eps: float) -> Optional[int]:
+    """Classify which side the object is on using the bbox bottom edge.
+
+    Returns:
+      -1 => definitely above line
+      +1 => definitely below line
+      None => within deadzone
+    """
+    if bottom_rel <= -eps:
+        return -1
+    if bottom_rel >= eps:
+        return 1
+    return None
+
+def build_count_line(curr_w: int, curr_h: int, offset_from_bottom_px: int):
+    """Return a horizontal counting line spanning full width at (height - offset)."""
+    y = max(0, int(curr_h) - int(offset_from_bottom_px))
+    return (0, y), (int(curr_w) - 1, y)
 
 # --- RTSP Quick Test Helper ---
-def rtsp_quick_test(model, device, urls, seconds=20, max_frames=None, sample_every_n=3):
-    """Open each RTSP stream and run lightweight inference for a short window.
+def rtsp_quick_test(model, device, url, seconds=20, max_frames=None, sample_every_n=3):
+    """Open an RTSP stream and run lightweight inference for a short window.
 
     This is meant as a connectivity + compatibility smoke-test on the LG admin machine.
     """
-    for url in urls:
-        print(f"\nRTSP test: {url}")
-        cap = cv2.VideoCapture(url)
-        if not cap.isOpened():
-            print("RTSP failed: could not open")
-            continue
+    print(f"\nRTSP test: {url}")
+    cap = cv2.VideoCapture(url)
+    if not cap.isOpened():
+        print("RTSP failed: could not open")
+        return
 
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        print(f"Opened: {w}x{h} reported_fps={fps:.2f}")
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    print(f"Opened: {w}x{h} reported_fps={fps:.2f}")
 
-        t_start = time.perf_counter()
-        frames = 0
-        infer_frames = 0
-        total_dets = 0
+    t_start = time.perf_counter()
+    frames = 0
+    infer_frames = 0
+    total_dets = 0
 
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                if (time.perf_counter() - t_start) < 5.0:
-                    continue
-                print("RTSP failed: no frames")
-                break
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            if (time.perf_counter() - t_start) < 5.0:
+                continue
+            print("RTSP failed: no frames")
+            break
 
-            frames += 1
+        frames += 1
 
-            do_infer = (frames % max(1, int(sample_every_n)) == 0)
-            if do_infer:
-                infer_frames += 1
-                results = model.predict(
-                    source=frame,
-                    imgsz=640,
-                    conf=CONFIDENCE_THRESHOLD,
-                    iou=0.70,
-                    max_det=300,
-                    device=device,
-                    verbose=False,
-                )
-                r = results[0]
-                det_count = int(len(r.boxes)) if (r.boxes is not None) else 0
-                total_dets += det_count
+        do_infer = (frames % max(1, int(sample_every_n)) == 0)
+        if do_infer:
+            infer_frames += 1
+            results = model.predict(
+                source=frame,
+                imgsz=640,
+                conf=CONFIDENCE_THRESHOLD,
+                iou=0.70,
+                max_det=300,
+                device=device,
+                verbose=False,
+            )
+            r = results[0]
+            det_count = int(len(r.boxes)) if (r.boxes is not None) else 0
+            total_dets += det_count
 
-            elapsed = time.perf_counter() - t_start
-            if max_frames is not None and frames >= int(max_frames):
-                break
-            if max_frames is None and elapsed >= float(seconds):
-                break
+        elapsed = time.perf_counter() - t_start
+        if max_frames is not None and frames >= int(max_frames):
+            break
+        if max_frames is None and elapsed >= float(seconds):
+            break
 
-        cap.release()
+    cap.release()
 
-        elapsed = max(1e-6, time.perf_counter() - t_start)
-        fps_measured = frames / elapsed
-        infer_fps = infer_frames / elapsed
-        avg_dets = (total_dets / max(1, infer_frames))
+    elapsed = max(1e-6, time.perf_counter() - t_start)
+    fps_measured = frames / elapsed
+    infer_fps = infer_frames / elapsed
+    avg_dets = (total_dets / max(1, infer_frames))
 
-        print(
-            f"RTSP ok: frames={frames} elapsed={elapsed:.2f}s fps={fps_measured:.2f} "
-            f"infer_frames={infer_frames} infer_fps={infer_fps:.2f} avg_dets={avg_dets:.2f}"
-        )
+    print(
+        f"RTSP ok: frames={frames} elapsed={elapsed:.2f}s fps={fps_measured:.2f} "
+        f"infer_frames={infer_frames} infer_fps={infer_fps:.2f} avg_dets={avg_dets:.2f}"
+    )
+
+
+# --- CLI Argument Parser ---
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="LG Box Counter (video file or RTSP stream)")
+    parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help=(
+            "Input source. Can be an RTSP URL (rtsp://...) or a path to a video file. "
+            "If omitted, the script processes mp4s from input_folder/VIDEO_GLOB."
+        ),
+    )
+    parser.add_argument(
+        "--rtsp-test",
+        action="store_true",
+        help="Run a short RTSP smoke test (connectivity + lightweight inference) and exit.",
+    )
+    parser.add_argument("--rtsp-seconds", type=int, default=20, help="RTSP test duration in seconds")
+    parser.add_argument(
+        "--rtsp-max-frames",
+        type=int,
+        default=None,
+        help="Optional cap on frames during RTSP test (overrides seconds if set)",
+    )
+    parser.add_argument(
+        "--rtsp-sample-every",
+        type=int,
+        default=3,
+        help="Run model on every Nth frame during RTSP test",
+    )
+    parser.add_argument(
+        "--camera-area",
+        type=str,
+        default=None,
+        help="Override CAMERA_AREA label used for logging/output naming",
+    )
+    parser.add_argument(
+        "--line-offset",
+        type=int,
+        default=None,
+        help="Override LINE_OFFSET_FROM_BOTTOM_PX",
+    )
+    # Removed --stats-every argument, now hardcoded
+    parser.add_argument(
+        "--clip-time",
+        type=int,
+        default=600,
+        help=(
+            "For RTSP sources, rotate/split the output into clips of this clip time (seconds). "
+            "Ignored for normal video files."
+        ),
+    )
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Disable live display window (cv2.imshow). Useful on servers.",
+    )
+    return parser
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def make_output_path(output_folder: str, area_tag: str, video_name: str, model_version: str, clip_index: int = 0) -> str:
+    timestamp = datetime.now().strftime("%H%M_%d%m%Y")
+    if clip_index > 0:
+        filename = f"{timestamp}_{area_tag}_{video_name}_clip{clip_index:03d}_LGmodelV{model_version}.mp4"
+    else:
+        filename = f"{timestamp}_{area_tag}_{video_name}_LGmodelV{model_version}.mp4"
+    return os.path.join(output_folder, filename)
 
 # --- Main Execution ---
 if __name__ == "__main__":
     print("LG Box Counter Starting...")
     init_db()
-    
+
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.camera_area is not None:
+        CAMERA_AREA = args.camera_area
+    if args.line_offset is not None:
+        LINE_OFFSET_FROM_BOTTOM_PX = int(args.line_offset)
+
     # Load Model (assume best.pt sits next to this script)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    WEIGHTS_PATH = os.path.join(script_dir, "best.pt")
+    WEIGHTS_PATH = os.path.join(script_dir, "bestnew.pt")
 
     if not os.path.isfile(WEIGHTS_PATH):
         raise FileNotFoundError(
@@ -364,67 +505,106 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    if ENABLE_RTSP_TEST:
+    if args.rtsp_test:
+        if args.source is None or not args.source.startswith("rtsp://"):
+            raise ValueError("For --rtsp-test, you must provide --source with an RTSP URL (rtsp://...)")
         rtsp_quick_test(
             model=model,
             device=DEVICE,
-            urls=RTSP_URLS,
-            seconds=RTSP_TEST_SECONDS,
-            max_frames=RTSP_TEST_MAX_FRAMES,
-            sample_every_n=RTSP_SAMPLE_EVERY_N_FRAMES,
+            url=args.source,
+            seconds=args.rtsp_seconds,
+            max_frames=args.rtsp_max_frames,
+            sample_every_n=args.rtsp_sample_every,
         )
         raise SystemExit(0)
 
-    # Process Videos
-    video_files = sorted(glob.glob(os.path.join(input_folder, VIDEO_GLOB)))
-    
+    # Select video files or stream source
+    if args.source is not None and not args.source.startswith("rtsp://"):
+        video_files = [args.source]
+    elif args.source is None:
+        video_files = sorted(glob.glob(os.path.join(input_folder, VIDEO_GLOB)))
+    elif args.source.startswith("rtsp://"):
+        video_files = [args.source]
+    else:
+        video_files = []
+
     if not video_files:
-        print(f"No .mp4 files found in: {input_folder}")
-    
+        if args.source is None:
+            print(f"No .mp4 files found in: {input_folder}")
+            print("You can specify a source with --source path/to/video.mp4 or --source rtsp://...")
+        else:
+            print(f"No video files or stream found for source: {args.source}")
+        raise SystemExit(1)
+
     for idx, video_path in enumerate(video_files):
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        
-        # DOCK19-only: always use the DOCK19 line
-        base_pt1, base_pt2 = DOCK19_LINE_BASE
+        is_rtsp = video_path.startswith("rtsp://")
+        video_name = "stream" if is_rtsp else os.path.splitext(os.path.basename(video_path))[0]
+        # If user supplied --camera-area, use that for output naming
+        area_tag = CAMERA_AREA
+        # Output path: for RTSP we will rotate into clips; for files it's one output.
+        clip_index = 0
+        output_path = make_output_path(output_folder, area_tag, video_name, MODEL_VERSION, clip_index=0)
 
-        # Generate Output Filename
-        timestamp = datetime.now().strftime("%H%M_%d%m%Y")
-        filename = f"{timestamp}_{DOCK_NAME}_{video_name}_LGmodelV{MODEL_VERSION}.mp4"
-        output_path = os.path.join(output_folder, filename)
-
-        print(f"\nProcessing: {video_name}.mp4")
+        print(f"\nProcessing: {video_name}.mp4" if not is_rtsp else f"\nProcessing RTSP stream: {video_path}")
+        if is_rtsp:
+            print(f"RTSP clip rotation: {int(args.clip_time)}s per clip")
         print(f"Saving to: {output_path}")
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
+            print(f"Could not open video/stream: {video_path}")
             continue
 
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if is_rtsp:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        else:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-        # Auto-Scale Line
-        line_pt1, line_pt2 = scale_line(base_pt1, base_pt2, frame_width, frame_height)
-        print(f"Scaled line: {line_pt1} -> {line_pt2}")
+        # Build horizontal line near the bottom of the frame
+        line_pt1, line_pt2 = build_count_line(frame_width, frame_height, LINE_OFFSET_FROM_BOTTOM_PX)
+        print(f"Count line: {line_pt1} -> {line_pt2}")
+        line_y = int(line_pt1[1])  # horizontal line
 
-        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width, frame_height))
+        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height))
+
+        # Clip bookkeeping (RTSP only)
+        clip_start_wall = time.perf_counter()
+        clip_start_utc = utc_now_iso()
+        clip_frames = 0
+
         tracker = Sort(max_age=30, min_hits=2, iou_threshold=0.3)
-        
+
         track_state = {}
         boxes_loaded = 0
         t0 = time.perf_counter()
         frame_count = 0
         dt_per_frame = 1.0 / fps
+        stats_last_print_t = time.perf_counter()
+        stats_every_s = int(STATS_PRINT_EVERY_S)
+        # For non-RTSP, ensure clip_start_utc is set
+        if not is_rtsp:
+            clip_start_utc = utc_now_iso()
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             frame_count += 1
+            clip_frames += 1
             current_time = frame_count * dt_per_frame
 
+            now_t = time.perf_counter()
+            if (now_t - stats_last_print_t) >= float(stats_every_s):
+                elapsed = max(1e-6, now_t - t0)
+                proc_fps = frame_count / elapsed
+                rt_pct = (proc_fps / max(1e-6, float(fps))) * 100.0
+                print(f"Perf: frames={frame_count} elapsed={elapsed:.1f}s avg_fps={proc_fps:.2f} realtime={rt_pct:.1f}%")
+                stats_last_print_t = now_t
+
             # Inference
-            results = model.predict(source=frame, imgsz=640, conf=CONFIDENCE_THRESHOLD, 
+            results = model.predict(source=frame, imgsz=640, conf=CONFIDENCE_THRESHOLD,
                                     iou=0.70, max_det=300, device=DEVICE, verbose=False)
             r = results[0]
 
@@ -444,61 +624,158 @@ if __name__ == "__main__":
             for *xyxy, track_id in tracked_objects:
                 x1b, y1b, x2b, y2b = map(int, xyxy)
                 cx, cy = int((x1b + x2b) / 2), int((y1b + y2b) / 2)
+                # Robust position signals relative to the counting line
+                top_rel, bottom_rel, bc_rel = bbox_rel_to_horizontal_line(x1b, y1b, x2b, y2b, line_y)
 
                 if track_id not in track_state:
                     track_state[track_id] = {
-                        "last_side": None, 
-                        "last_event_time": -999.0, 
-                        "last_seen_frame": frame_count, 
-                        "frames_seen": 0
+                        "last_side": None,          # legacy (kept, but we now use stable_side)
+                        "stable_side": None,        # -1 above, +1 below, None unknown/within deadzone
+                        "last_in_time": -999.0,     # last time we incremented
+                        "last_out_time": -999.0,    # last time we decremented
+                        "last_seen_frame": frame_count,
+                        "frames_seen": 0,
+                        "counted": False,
                     }
-                
+
                 st = track_state[track_id]
                 st["last_seen_frame"] = frame_count
                 st["frames_seen"] += 1
 
-                current_side_val = point_side(cx, cy, line_pt1, line_pt2)
+                # Determine a stable side using bbox bottom edge (more stable near frame boundary)
+                side_now = classify_bbox_side(bottom_rel, LINE_CROSS_EPS)
+                prev_side = st.get("stable_side", None)
 
-                if abs(current_side_val) >= LINE_CROSS_EPS:
-                    prev_side_val = st["last_side"]
-                    
-                    if prev_side_val is None:
-                        st["last_side"] = current_side_val
-                    else:
-                        if (prev_side_val < 0 and current_side_val > 0) or (prev_side_val > 0 and current_side_val < 0):
-                            if (current_time - st["last_event_time"]) > EVENT_COOLDOWN_SECONDS:
-                                if prev_side_val > 0 and current_side_val < 0:
-                                    if st["frames_seen"] > MIN_TRACK_FRAMES_BEFORE_COUNT:
-                                        boxes_loaded += 1
-                                        st["last_event_time"] = current_time
-                                        print(f"ID {int(track_id)} IN -> Total: {boxes_loaded}")
-                                        log_count(DOCK_NAME, boxes_loaded, +1, video_name, WEIGHTS_PATH, MODEL_VERSION)
-                                elif prev_side_val < 0 and current_side_val > 0:
-                                    if st["frames_seen"] > MIN_TRACK_FRAMES_BEFORE_COUNT:
-                                        boxes_loaded -= 1
-                                        st["last_event_time"] = current_time
-                                        print(f"ID {int(track_id)} OUT -> Total: {boxes_loaded}")
-                                        log_count(DOCK_NAME, boxes_loaded, -1, video_name, WEIGHTS_PATH, MODEL_VERSION)
-                        
-                        st["last_side"] = current_side_val
+                # Initialize side if unknown (only when confidently away from line)
+                if prev_side is None and side_now is not None:
+                    st["stable_side"] = side_now
+                    prev_side = side_now
 
-                cv2.rectangle(frame, (x1b, y1b), (x2b, y2b), (0, 0, 255), 2)
-                cv2.putText(frame, f"ID {int(track_id)}", (x1b, y1b - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                # Only consider transitions when we have a confident current side
+                # Use overlap-based side logic for both increment and decrement, symmetrically.
+                COUNTED_SIDE = 1  # BELOW the line is the counted side
+                if side_now is not None and prev_side is not None and side_now != prev_side:
+                    # Increment: moved ONTO counted side (bottom edge goes from above->below)
+                    if side_now == COUNTED_SIDE and prev_side != COUNTED_SIDE:
+                        # For IN we still want a tiny amount of protection against instant re-ids/jitter,
+                        # and we only count once the track has existed a few frames.
+                        if st["frames_seen"] > MIN_TRACK_FRAMES_BEFORE_COUNT:
+                            if (current_time - st["last_in_time"]) > IN_EVENT_COOLDOWN_SECONDS:
+                                boxes_loaded += 1
+                                st["counted"] = True
+                                st["last_in_time"] = current_time
+                                print(f"ID {int(track_id)} IN -> Total: {boxes_loaded}")
+                                # DB logging per event removed
+
+                    # Decrement: moved OFF counted side (bottom edge goes from below->above)
+                    elif prev_side == COUNTED_SIDE and side_now != COUNTED_SIDE:
+                        # For OUT: allow fast "tip over then pull back" to immediately -1.
+                        # Only require that this track had been counted.
+                        if st.get("counted", False):
+                            if (current_time - st["last_out_time"]) > OUT_EVENT_COOLDOWN_SECONDS:
+                                boxes_loaded = max(0, boxes_loaded - 1)
+                                st["counted"] = False
+                                st["last_out_time"] = current_time
+                                print(f"ID {int(track_id)} OUT -> Total: {boxes_loaded}")
+                                # DB logging per event removed
+
+                    # Update stable side after processing
+                    st["stable_side"] = side_now
+
+                # Keep legacy last_side updated for debugging/compat
+                st["last_side"] = 1.0 if side_now == 1 else (-1.0 if side_now == -1 else st.get("last_side"))
+
+                color = (0, 255, 0) if st.get("counted", False) else (0, 0, 255)
+                cv2.rectangle(frame, (x1b, y1b), (x2b, y2b), color, 2)
+                cv2.putText(frame, f"ID {int(track_id)}", (x1b, y1b - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             ids_to_remove = [tid for tid, st in track_state.items() if (frame_count - st["last_seen_frame"]) > ID_PURGE_FRAMES]
             for tid in ids_to_remove:
                 del track_state[tid]
 
             cv2.line(frame, line_pt1, line_pt2, (0, 0, 255), 2)
-            cv2.putText(frame, f"Count: {boxes_loaded}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(frame, f"Count: {boxes_loaded}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 2.2, (0, 255, 0), 4)
             out.write(frame)
-            cv2.imshow("LG Counter - DOCK19", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            if not args.no_display:
+                cv2.imshow("LG Counter", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+            # RTSP: rotate output into fixed-duration clips
+            if is_rtsp:
+                if (time.perf_counter() - clip_start_wall) >= float(args.clip_time):
+                    # finalize current clip
+                    out.release()
+                    clip_end_utc = utc_now_iso()
+                    try:
+                        log_clip_summary(
+                            camera_area=CAMERA_AREA,
+                            clip_start_utc=clip_start_utc,
+                            clip_end_utc=clip_end_utc,
+                            source=video_path,
+                            output_path=output_path,
+                            final_box_count=boxes_loaded,
+                            model_path=WEIGHTS_PATH,
+                            model_version=MODEL_VERSION,
+                        )
+                    except Exception as e:
+                        print(f"DB log failed (clip summary): {e}")
+
+                    # start a new clip: reset RTSP stream and all per-clip state
+                    clip_index += 1
+                    output_path = make_output_path(output_folder, area_tag, video_name, MODEL_VERSION, clip_index=clip_index)
+                    print(f"Rotating clip -> {output_path}")
+                    cap.release()
+                    cap = cv2.VideoCapture(video_path)
+                    if not cap.isOpened():
+                        print(f"Could not reopen RTSP stream: {video_path}")
+                        break
+                    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                    line_pt1, line_pt2 = build_count_line(frame_width, frame_height, LINE_OFFSET_FROM_BOTTOM_PX)
+                    line_y = int(line_pt1[1])
+                    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height))
+                    tracker = Sort(max_age=30, min_hits=2, iou_threshold=0.3)
+                    track_state = {}
+                    clip_start_wall = time.perf_counter()
+                    clip_start_utc = utc_now_iso()
+                    clip_frames = 0
 
         cap.release()
         out.release()
-        
-        log_count(DOCK_NAME, boxes_loaded, 0, video_name + "_FINAL", WEIGHTS_PATH, MODEL_VERSION)
+
+        # Finalize DB logging once per saved output
+        clip_end_utc = utc_now_iso()
+        if is_rtsp:
+            try:
+                log_clip_summary(
+                    camera_area=CAMERA_AREA,
+                    clip_start_utc=clip_start_utc,
+                    clip_end_utc=clip_end_utc,
+                    source=video_path,
+                    output_path=output_path,
+                    final_box_count=boxes_loaded,
+                    model_path=WEIGHTS_PATH,
+                    model_version=MODEL_VERSION,
+                )
+            except Exception as e:
+                print(f"DB log failed (final RTSP clip): {e}")
+        else:
+            try:
+                log_clip_summary(
+                    camera_area=CAMERA_AREA,
+                    clip_start_utc=clip_start_utc,
+                    clip_end_utc=clip_end_utc,
+                    source=video_path,
+                    output_path=output_path,
+                    final_box_count=boxes_loaded,
+                    model_path=WEIGHTS_PATH,
+                    model_version=MODEL_VERSION,
+                )
+            except Exception as e:
+                print(f"DB log failed (video summary): {e}")
+
         dt = time.perf_counter() - t0
         fps_val = frame_count / dt if dt > 0 else 0.0
         print(f"Processed {frame_count} frames in {dt:.2f}s -> {fps_val:.2f} FPS")
